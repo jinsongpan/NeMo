@@ -14,6 +14,8 @@
 
 import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import torch
 from packaging import version
@@ -30,12 +32,11 @@ from nemo.core.neural_types import (
     SpectrogramType,
 )
 from nemo.utils import logging
-from nemo.utils.decorators import experimental
 
 try:
     import torchaudio
-    import torchaudio.transforms
     import torchaudio.functional
+    import torchaudio.transforms
 
     TORCHAUDIO_VERSION = version.parse(torchaudio.__version__)
     TORCHAUDIO_VERSION_MIN = version.parse('0.5')
@@ -138,12 +139,14 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor):
                 a multiple of pad_to.
                 Defaults to 16
             frame_splicing (int): Defaults to 1
+            exact_pad (bool): If True, sets stft center to False and adds padding, such that num_frames = audio_length
+                // hop_length. Defaults to False.
             stft_exact_pad (bool): If True, uses pytorch_stft and convolutions with
                 padding such that num_frames = num_samples / hop_length. If False,
                 stft_conv will be used to determine how stft will be performed.
-                Defaults to False
+                Defaults to False. TODO:This feature is deprecated and will be removed in 1.1.0
             stft_conv (bool): If True, uses pytorch_stft and convolutions. If
-                False, uses torch.stft.
+                False, uses torch.stft. TODO:This feature is deprecated and will be removed in 1.1.0
                 Defaults to False
             pad_value (float): The value that shorter mels are padded with.
                 Defaults to 0
@@ -203,6 +206,7 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor):
         dither=1e-5,
         pad_to=16,
         frame_splicing=1,
+        exact_pad=False,
         stft_exact_pad=False,
         stft_conv=False,
         pad_value=0,
@@ -239,6 +243,7 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor):
             dither=dither,
             pad_to=pad_to,
             frame_splicing=frame_splicing,
+            exact_pad=exact_pad,
             stft_exact_pad=stft_exact_pad,
             stft_conv=stft_conv,
             pad_value=pad_value,
@@ -449,6 +454,7 @@ class SpectrogramAugmentation(NeuralModule):
         rect_time=5,
         rect_freq=20,
         rng=None,
+        mask_value=0.0,
     ):
         super().__init__()
 
@@ -460,7 +466,12 @@ class SpectrogramAugmentation(NeuralModule):
 
         if freq_masks + time_masks > 0:
             self.spec_augment = SpecAugment(
-                freq_masks=freq_masks, time_masks=time_masks, freq_width=freq_width, time_width=time_width, rng=rng,
+                freq_masks=freq_masks,
+                time_masks=time_masks,
+                freq_width=freq_width,
+                time_width=time_width,
+                rng=rng,
+                mask_value=mask_value,
             )
         else:
             self.spec_augment = lambda x: x
@@ -543,3 +554,70 @@ class CropOrPadSpectrogramAugmentation(NeuralModule):
     @classmethod
     def restore_from(cls, restore_path: str):
         pass
+
+
+@dataclass
+class AudioToMelSpectrogramPreprocessorConfig:
+    _target_: str = "nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor"
+    sample_rate: int = 16000
+    window_size: float = 0.02
+    window_stride: float = 0.01
+    n_window_size: Optional[int] = None
+    n_window_stride: Optional[int] = None
+    window: str = "hann"
+    normalize: str = "per_feature"
+    n_fft: Optional[int] = None
+    preemph: float = 0.97
+    features: int = 64
+    lowfreq: int = 0
+    highfreq: Optional[int] = None
+    log: bool = True
+    log_zero_guard_type: str = "add"
+    log_zero_guard_value: float = 2 ** -24
+    dither: float = 1e-5
+    pad_to: int = 16
+    frame_splicing: int = 1
+    exact_pad: bool = False
+    stft_exact_pad: bool = False
+    stft_conv: bool = False
+    pad_value: int = 0
+    mag_power: float = 2.0
+
+
+@dataclass
+class AudioToMFCCPreprocessorConfig:
+    _target_: str = 'nemo.collections.asr.modules.AudioToMFCCPreprocessor'
+    sample_rate: int = 16000
+    window_size: float = 0.02
+    window_stride: float = 0.01
+    n_window_size: Optional[int] = None
+    n_window_stride: Optional[int] = None
+    window: str = 'hann'
+    n_fft: Optional[int] = None
+    lowfreq: Optional[float] = 0.0
+    highfreq: Optional[float] = None
+    n_mels: int = 64
+    n_mfcc: int = 64
+    dct_type: int = 2
+    norm: str = 'ortho'
+    log: bool = True
+
+
+@dataclass
+class SpectrogramAugmentationConfig:
+    _target_: str = "nemo.collections.asr.modules.SpectrogramAugmentation"
+    freq_masks: int = 0
+    time_masks: int = 0
+    freq_width: int = 0
+    time_width: Optional[Any] = 0
+    rect_masks: int = 0
+    rect_time: int = 0
+    rect_freq: int = 0
+    mask_value: float = 0
+    rng: Optional[Any] = None  # random.Random() type
+
+
+@dataclass
+class CropOrPadSpectrogramAugmentationConfig:
+    audio_length: int
+    _target_: str = "nemo.collections.asr.modules.CropOrPadSpectrogramAugmentation"

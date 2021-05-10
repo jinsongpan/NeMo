@@ -11,12 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from abc import ABC, abstractmethod
-from typing import Dict, List
+from typing import List, Optional, Union
 
 import torch
+from omegaconf import OmegaConf
 
 from nemo.core.classes import ModelPT
+from nemo.core.classes.exportable import Exportable
+from nemo.utils import model_utils
 
 __all__ = ['ASRModel']
 
@@ -38,7 +42,7 @@ class ASRModel(ModelPT, ABC):
         val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
         wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
         wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {'validation_loss': val_loss_mean, 'validation_wer': wer_num / wer_denom}
+        tensorboard_logs = {'val_loss': val_loss_mean, 'val_wer': wer_num / wer_denom}
         return {'val_loss': val_loss_mean, 'log': tensorboard_logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
@@ -47,3 +51,41 @@ class ASRModel(ModelPT, ABC):
         wer_denom = torch.stack([x['test_wer_denom'] for x in outputs]).sum()
         tensorboard_logs = {'test_loss': val_loss_mean, 'test_wer': wer_num / wer_denom}
         return {'test_loss': val_loss_mean, 'log': tensorboard_logs}
+
+    @classmethod
+    def list_available_models(cls) -> 'List[PretrainedModelInfo]':
+        """
+        This method returns a list of pre-trained model which can be instantiated directly from NVIDIA's NGC cloud.
+        Returns:
+            List of available pre-trained models.
+        """
+        # recursively walk the subclasses to generate pretrained model info
+        list_of_models = model_utils.resolve_subclass_pretrained_model_info(cls)
+        return list_of_models
+
+
+class ExportableEncDecModel(Exportable):
+    """
+    Simple utiliy mix-in to export models that consist of encoder/decoder pair 
+    plus pre/post processor, but have to be exported as encoder/decoder pair only
+    (covers most ASR classes)
+    """
+
+    @property
+    def input_module(self):
+        return self.encoder
+
+    @property
+    def output_module(self):
+        return self.decoder
+
+    def forward_for_export(self, input, length=None):
+        encoder_output = self.input_module(input, length)
+        if isinstance(encoder_output, tuple):
+            return self.output_module(encoder_output[0])
+        else:
+            return self.output_module(encoder_output)
+
+    def _prepare_for_export(self, **kwargs):
+        self.input_module._prepare_for_export(**kwargs)
+        self.output_module._prepare_for_export(**kwargs)

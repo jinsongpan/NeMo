@@ -14,14 +14,38 @@
 
 import copy
 import os
+from dataclasses import dataclass, is_dataclass
+from enum import Enum
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
+import pytorch_lightning as pl
+import wrapt
 from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf import errors as omegaconf_errors
+from packaging import version
 
 from nemo.utils import logging
 
 _VAL_TEST_FASTPATH_KEY = 'ds_item'
+
+
+class ArtifactPathType(Enum):
+    """
+    ArtifactPathType refers to the type of the path that the artifact is located at.
+
+    LOCAL_PATH: A user local filepath that exists on the file system.
+    TAR_PATH: A (generally flattened) filepath that exists inside of an archive (that may have its own full path).
+    """
+
+    LOCAL_PATH = 0
+    TAR_PATH = 1
+
+
+@dataclass(init=False)
+class ArtifactItem:
+    path: str
+    path_type: ArtifactPathType
 
 
 def resolve_dataset_name_from_cfg(cfg: DictConfig) -> str:
@@ -197,15 +221,15 @@ def resolve_validation_dataloaders(model: 'ModelPT'):
     dataloaders = []
 
     # process val_loss_idx
-    if 'val_loss_idx' in cfg.validation_ds:
+    if 'val_dl_idx' in cfg.validation_ds:
         cfg = OmegaConf.to_container(cfg)
-        val_loss_idx = cfg['validation_ds'].pop('val_loss_idx')
+        val_dl_idx = cfg['validation_ds'].pop('val_dl_idx')
         cfg = OmegaConf.create(cfg)
     else:
-        val_loss_idx = 0
+        val_dl_idx = 0
 
     # Set val_loss_idx
-    model._validation_loss_idx = val_loss_idx
+    model._val_dl_idx = val_dl_idx
 
     ds_key = resolve_dataset_name_from_cfg(cfg.validation_ds)
 
@@ -266,15 +290,15 @@ def resolve_test_dataloaders(model: 'ModelPT'):
     dataloaders = []
 
     # process test_loss_idx
-    if 'test_loss_idx' in cfg.test_ds:
+    if 'test_dl_idx' in cfg.test_ds:
         cfg = OmegaConf.to_container(cfg)
-        test_loss_idx = cfg['test_ds'].pop('test_loss_idx')
+        test_dl_idx = cfg['test_ds'].pop('test_dl_idx')
         cfg = OmegaConf.create(cfg)
     else:
-        test_loss_idx = 0
+        test_dl_idx = 0
 
     # Set val_loss_idx
-    model._test_loss_idx = test_loss_idx
+    model._test_dl_idx = test_dl_idx
 
     ds_key = resolve_dataset_name_from_cfg(cfg.test_ds)
 
@@ -307,3 +331,188 @@ def resolve_test_dataloaders(model: 'ModelPT'):
         model._test_names = [parse_dataset_as_name(ds_values)]
 
         unique_names_check(name_list=model._test_names)
+
+
+@wrapt.decorator
+def wrap_training_step(wrapped, instance: pl.LightningModule, args, kwargs):
+    output_dict = wrapped(*args, **kwargs)
+
+    if isinstance(output_dict, dict) and output_dict is not None and 'log' in output_dict:
+        log_dict = output_dict.pop('log')
+        instance.log_dict(log_dict, on_step=True)
+
+    return output_dict
+
+
+def convert_model_config_to_dict_config(cfg: Union[DictConfig, 'NemoConfig']) -> DictConfig:
+    """
+    Converts its input into a standard DictConfig.
+    Possible input values are:
+    -   DictConfig
+    -   A dataclass which is a subclass of NemoConfig
+
+    Args:
+        cfg: A dict-like object.
+
+    Returns:
+        The equivalent DictConfig
+    """
+    if not isinstance(cfg, (OmegaConf, DictConfig)) and is_dataclass(cfg):
+        cfg = OmegaConf.structured(cfg)
+
+    if not isinstance(cfg, DictConfig):
+        raise ValueError(f"cfg constructor argument must be of type DictConfig/dict but got {type(cfg)} instead.")
+
+    config = OmegaConf.to_container(cfg, resolve=True)
+    config = OmegaConf.create(config)
+    return config
+
+
+def _convert_config(cfg: OmegaConf):
+    """ Recursive function convertint the configuration from old hydra format to the new one. """
+
+    # Get rid of cls -> _target_.
+    if 'cls' in cfg and "_target_" not in cfg:
+        cfg._target_ = cfg.pop("cls")
+
+    # Get rid of params.
+    if 'params' in cfg:
+        params = cfg.pop('params')
+        for param_key, param_val in params.items():
+            cfg[param_key] = param_val
+
+    # Recursion.
+    try:
+        for _, sub_cfg in cfg.items():
+            if isinstance(sub_cfg, DictConfig):
+                _convert_config(sub_cfg)
+    except omegaconf_errors.OmegaConfBaseException as e:
+        logging.warning(f"Skipping config conversion for cfg:\n{cfg}\n due to OmegaConf error encountered :\n{e}.")
+
+
+def maybe_update_config_version(cfg: DictConfig):
+    """
+    Recursively convert Hydra 0.x configs to Hydra 1.x configs.
+
+    Changes include:
+    -   `cls` -> `_target_`.
+    -   `params` -> drop params and shift all arguments to parent.
+
+    Args:
+        cfg: Any Hydra compatible DictConfig
+
+    Returns:
+        An updated DictConfig that conforms to Hydra 1.x format.
+    """
+    # Make a copy of model config.
+    cfg = copy.deepcopy(cfg)
+    OmegaConf.set_struct(cfg, False)
+
+    # Convert config.
+    _convert_config(cfg)
+
+    # Update model config.
+    OmegaConf.set_struct(cfg, True)
+
+    return cfg
+
+
+def import_class_by_path(path: str):
+    """
+    Recursive import of class by path string.
+    """
+    paths = path.split('.')
+    path = ".".join(paths[:-1])
+    class_name = paths[-1]
+    mod = __import__(path, fromlist=[class_name])
+    mod = getattr(mod, class_name)
+    return mod
+
+
+def resolve_subclass_pretrained_model_info(base_class) -> List['PretrainedModelInfo']:
+    """
+    Recursively traverses the inheritance graph of subclasses to extract all pretrained model info.
+    First constructs a set of unique pretrained model info by performing DFS over the inheritance graph.
+    All model info belonging to the same class is added together.
+
+    Args:
+        base_class: The root class, whose subclass graph will be traversed.
+
+    Returns:
+        A list of unique pretrained model infos belonging to all of the inherited subclasses of
+        this baseclass.
+    """
+    list_of_models = set()
+
+    def recursive_subclass_walk(cls):
+        for subclass in cls.__subclasses__():
+            # step into its immediate subclass
+            recursive_subclass_walk(subclass)
+
+            subclass_models = subclass.list_available_models()
+
+            if subclass_models is not None and len(subclass_models) > 0:
+                # Inject subclass info into pretrained model info
+                # if not already overriden by subclass
+                for model_info in subclass_models:
+                    # If subclass manually injects class_, dont override.
+                    if model_info.class_ is None:
+                        model_info.class_ = subclass
+
+                for model_info in subclass_models:
+                    list_of_models.add(model_info)
+
+    recursive_subclass_walk(base_class)
+
+    list_of_models = list(sorted(list_of_models))
+    return list_of_models
+
+
+def check_lib_version(lib_name: str, checked_version: str, operator) -> (Optional[bool], str):
+    """
+    Checks if a library is installed, and if it is, checks the operator(lib.__version__, checked_version) as a result.
+    This bool result along with a string analysis of result is returned.
+
+    If the library is not installed at all, then returns None instead, along with a string explaining
+    that the library is not installed
+
+    Args:
+        lib_name: lower case str name of the library that must be imported.
+        checked_version: semver string that is compared against lib.__version__.
+        operator: binary callable function func(a, b) -> bool; that compares lib.__version__ against version in
+            some manner. Must return a boolean.
+
+    Returns:
+        A tuple of results:
+        -   Bool or None. Bool if the library could be imported, and the result of
+            operator(lib.__version__, checked_version) or False if __version__ is not implemented in lib.
+            None is passed if the library is not installed at all.
+        -   A string analysis of the check.
+    """
+    try:
+        mod = __import__(lib_name)
+
+        if hasattr(mod, '__version__'):
+            lib_ver = version.Version(mod.__version__)
+            match_ver = version.Version(checked_version)
+
+            if operator(lib_ver, match_ver):
+                msg = f"Lib {lib_name} version is satisfied !"
+                return True, msg
+            else:
+                msg = (
+                    f"Lib {lib_name} version ({lib_ver}) is not {operator.__name__} than required version {checked_version}.\n"
+                    f"Please upgrade the lib using either pip or conda to the latest version."
+                )
+                return False, msg
+        else:
+            msg = (
+                f"Lib {lib_name} does not implement __version__ in its init file. "
+                f"Could not check version compatibility."
+            )
+            return False, msg
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+    msg = f"Lib {lib_name} has not been installed. Please use pip or conda to install this package."
+    return None, msg

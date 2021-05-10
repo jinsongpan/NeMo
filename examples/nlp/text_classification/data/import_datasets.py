@@ -13,15 +13,18 @@
 # limitations under the License.
 
 """
-This script can be used to process and import IMDB, chemprot, sst-2, and thucnews datasets into NeMo's format.
-You may run it as t
+This script can be used to process and import IMDB, ChemProt, SST-2, and THUCnews datasets into NeMo's format.
+You may run it as the following:
 
 python import_datasets.py \
-        --dataset_name thucnews \
-        --source_data_dir "./thucnews_orig_data/" \
-        --target_data_dir "./thucnews/"
+        --dataset_name DATASET_NAME \
+        --target_data_dir TARGET_PATH \
+        --source_data_dir SOURCE_PATH
 
-It reads the data from "source_data_dir" folder, processes and converts the data into NeMo's format. Then writes the results into "target_data_dir" folder.
+The dataset should be specified by "DATASET_NAME" which can be from ["sst-2", "chemprot", "imdb", "thucnews"].
+It reads the data from "SOURCE_PATH" folder, processes and converts the data into NeMo's format.
+Then writes the results into "TARGET_PATH" folder.
+
 """
 
 import argparse
@@ -40,7 +43,8 @@ def process_imdb(infold, outfold, uncased, modes=['train', 'test']):
         link = 'https://ai.stanford.edu/~amaas/data/sentiment/'
         raise ValueError(
             f'Data not found at {infold}. '
-            f'Please download IMDB reviews dataset from {link} and extract it into the folder specified by source_data_dir argument.'
+            f'Please download IMDB reviews dataset from {link} and '
+            f'extract it into the folder specified by source_data_dir argument.'
         )
 
     logging.info(f'Processing IMDB dataset and store at {outfold}')
@@ -62,8 +66,61 @@ def process_imdb(infold, outfold, uncased, modes=['train', 'test']):
                     review = review.lower()
                 review = review.replace("<br />", "")
                 outfiles[mode].write(f'{review}\t{label}\n')
+
     for mode in modes:
         outfiles[mode].close()
+
+    class_labels_file = open(os.path.join(outfold, 'label_ids.tsv'), 'w')
+    class_labels_file.write('negative\npositive\n')
+    class_labels_file.close()
+
+
+def process_sst2(infold, outfold, uncased, splits=['train', 'dev']):
+    """Process sst2 dataset."""
+    # "test" split doesn't have labels, so it is skipped
+    if not os.path.exists(infold):
+        link = 'https://dl.fbaipublicfiles.com/glue/data/SST-2.zip'
+        raise ValueError(
+            f'Data not found at {infold}. Please download SST-2 dataset from `{link}` and '
+            f'extract it into the folder specified by `source_data_dir` argument.'
+        )
+
+    logging.info(f'Processing SST-2 dataset')
+    os.makedirs(outfold, exist_ok=True)
+
+    def _read_tsv(input_file, quotechar=None):
+        """Read a tab separated value file."""
+        with open(input_file, "r") as f:
+            reader = csv.reader(f, delimiter="\t", quotechar=quotechar)
+            lines = []
+            for line in reader:
+                lines.append(line)
+            return lines
+
+    for split in splits:
+        # Load input file.
+        input_file = os.path.join(infold, split + '.tsv')
+        lines = _read_tsv(input_file)
+        # Create output.
+        outfile = open(os.path.join(outfold, split + '.tsv'), 'w')
+
+        # Copy lines, skip the header (line 0).
+        for line in lines[1:]:
+            text = line[0]
+            label = line[1]
+            # Lowercase when required.
+            if uncased:
+                text = text.lower()
+            # Write output.
+            outfile.write(f'{text}\t{label}\n')
+        # Close file.
+        outfile.close()
+
+    class_labels_file = open(os.path.join(outfold, 'label_ids.tsv'), 'w')
+    class_labels_file.write('negative\npositive\n')
+    class_labels_file.close()
+
+    logging.info(f'Result stored at {outfold}')
 
 
 def process_chemprot(source_dir, target_dir, uncased, modes=['train', 'test', 'dev']):
@@ -153,9 +210,7 @@ def process_thucnews(infold, outfold):
 if __name__ == "__main__":
     # Parse the command-line arguments.
     parser = argparse.ArgumentParser(description="Process and convert datasets into NeMo\'s format.")
-    parser.add_argument(
-        "--dataset_name", required=True, type=str, choices=['imdb', 'thucnews', 'chemprot'],
-    )
+    parser.add_argument("--dataset_name", required=True, type=str, choices=['imdb', 'thucnews', 'chemprot'])
     parser.add_argument(
         "--source_data_dir", required=True, type=str, help='The path to the folder containing the dataset files.'
     )
@@ -177,6 +232,8 @@ if __name__ == "__main__":
         process_thucnews(source_dir, target_dir)
     elif dataset_name == "chemprot":
         process_chemprot(source_dir, target_dir, do_lower_case)
+    elif dataset_name == "sst-2":
+        process_sst2(source_dir, target_dir, do_lower_case)
     else:
         raise ValueError(
             f'Dataset {dataset_name} is not supported.'

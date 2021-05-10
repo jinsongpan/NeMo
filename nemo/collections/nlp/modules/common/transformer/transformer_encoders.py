@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import copy
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from omegaconf.omegaconf import MISSING
 
 from nemo.collections.common.parts import form_attention_mask
 from nemo.collections.nlp.modules.common.transformer.transformer_modules import MultiHeadAttention, PositionWiseFF
@@ -41,32 +43,90 @@ class TransformerEncoderBlock(nn.Module):
 
     def __init__(
         self,
-        hidden_size,
-        inner_size,
-        num_attention_heads=1,
-        attn_score_dropout=0,
-        attn_layer_dropout=0,
-        ffn_dropout=0,
-        hidden_act="relu",
+        hidden_size: int,
+        inner_size: int,
+        num_attention_heads: int = 1,
+        attn_score_dropout: float = 0.0,
+        attn_layer_dropout: float = 0.0,
+        ffn_dropout: float = 0.0,
+        hidden_act: str = "relu",
+        pre_ln: bool = False,
     ):
         super().__init__()
-
+        self.pre_ln = pre_ln
+        self.layer_norm_1 = nn.LayerNorm(hidden_size, eps=1e-5)
         self.first_sub_layer = MultiHeadAttention(
             hidden_size, num_attention_heads, attn_score_dropout, attn_layer_dropout
         )
+        self.layer_norm_2 = nn.LayerNorm(hidden_size, eps=1e-5)
         self.second_sub_layer = PositionWiseFF(hidden_size, inner_size, ffn_dropout, hidden_act)
 
-    def forward(self, encoder_query, encoder_mask, encoder_keys):
+    def forward_preln(self, encoder_query, encoder_mask, encoder_keys):
+        """
+        Pre-LayerNorm block
+        Order of operations: LN -> Self-Attn -> Residual -> LN -> Cross-Attn -> Residual -> LN -> FFN
+        """
+        residual = encoder_query
+        encoder_query = self.layer_norm_1(encoder_query)
+        encoder_keys = self.layer_norm_1(encoder_keys)
         self_attn_output = self.first_sub_layer(encoder_query, encoder_keys, encoder_keys, encoder_mask)
+        self_attn_output += residual
+
+        residual = self_attn_output
+        self_attn_output = self.layer_norm_2(self_attn_output)
         output_states = self.second_sub_layer(self_attn_output)
+        output_states += residual
+
         return output_states
+
+    def forward_postln(self, encoder_query, encoder_mask, encoder_keys):
+        """
+        Post-LayerNorm block
+        Order of operations: Self-Attn -> Residual -> LN -> Cross-Attn -> Residual -> LN -> FFN -> Residual -> LN
+        """
+        self_attn_output = self.first_sub_layer(encoder_query, encoder_keys, encoder_keys, encoder_mask)
+        self_attn_output += encoder_query
+        self_attn_output = self.layer_norm_1(self_attn_output)
+
+        output_states = self.second_sub_layer(self_attn_output)
+        output_states += self_attn_output
+        output_states = self.layer_norm_2(output_states)
+
+        return output_states
+
+    def forward(self, encoder_query, encoder_mask, encoder_keys):
+        if self.pre_ln:
+            return self.forward_preln(encoder_query, encoder_mask, encoder_keys)
+        else:
+            return self.forward_postln(encoder_query, encoder_mask, encoder_keys)
 
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, num_layers, hidden_size, mask_future=False, **kwargs):
+    def __init__(
+        self,
+        num_layers: int,
+        hidden_size: int,
+        inner_size: int,
+        mask_future: bool = False,
+        num_attention_heads: int = 1,
+        attn_score_dropout: float = 0.0,
+        attn_layer_dropout: float = 0.0,
+        ffn_dropout: float = 0.0,
+        hidden_act: str = "relu",
+        pre_ln: bool = False,
+    ):
         super().__init__()
 
-        layer = TransformerEncoderBlock(hidden_size, **kwargs)
+        layer = TransformerEncoderBlock(
+            hidden_size,
+            inner_size,
+            num_attention_heads,
+            attn_score_dropout,
+            attn_layer_dropout,
+            ffn_dropout,
+            hidden_act,
+            pre_ln,
+        )
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(num_layers)])
         self.diag = 0 if mask_future else None
 

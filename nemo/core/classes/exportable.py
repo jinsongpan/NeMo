@@ -22,6 +22,7 @@ import torch
 
 from nemo.core.classes import typecheck
 from nemo.core.neural_types import AxisKind, NeuralType
+from nemo.utils import logging
 from nemo.utils.export_utils import replace_for_export
 
 __all__ = ['ExportFormat', 'Exportable']
@@ -36,6 +37,7 @@ class ExportFormat(Enum):
 
 _EXT_DICT = {
     ".pt": ExportFormat.TORCHSCRIPT,
+    ".ts": ExportFormat.TORCHSCRIPT,
     ".onnx": ExportFormat.ONNX,
 }
 
@@ -45,6 +47,68 @@ class Exportable(ABC):
     This Interface should be implemented by particular classes derived from nemo.core.NeuralModule or nemo.core.ModelPT.
     It gives these entities ability to be exported for deployment to formats such as ONNX.
     """
+
+    @staticmethod
+    def get_format(filename: str):
+        _, ext = os.path.splitext(filename)
+        try:
+            return _EXT_DICT[ext]
+        except KeyError:
+            raise ValueError(f"Export file {filename} extension does not correspond to any export format!")
+
+    @property
+    def input_module(self):
+        return self
+
+    @property
+    def output_module(self):
+        return self
+
+    def get_input_names(self, input_example):
+        if isinstance(input_example, Dict):
+            input_names = list(input_example.keys())
+        else:
+            if not (hasattr(self, 'input_types')):
+                raise NotImplementedError(
+                    'For export to work you must define input_types or pass names in input_example'
+                )
+            input_names = list(self.input_types.keys())
+        # remove unnecessary inputs for input_ports
+        for name in self.disabled_deployment_input_names:
+            input_names.remove(name)
+        return input_names
+
+    def get_output_names(self, output_example):
+        if isinstance(output_example, Dict):
+            output_names = list(output_example.keys())
+        else:
+            if not (hasattr(self, 'output_types')):
+                raise NotImplementedError(
+                    'For export to work you must define output_types or pass names in output_example'
+                )
+            output_names = list(self.output_types.keys())
+            # remove unnecessary inputs for input_ports
+        for name in self.disabled_deployment_output_names:
+            output_names.remove(name)
+        return output_names
+
+    def get_input_dynamic_axes(self, input_names):
+        dynamic_axes = defaultdict(list)
+        for name in input_names:
+            dynamic_axes = {
+                **dynamic_axes,
+                **self._extract_dynamic_axes(name, self.input_types[name]),
+            }
+        return dynamic_axes
+
+    def get_output_dynamic_axes(self, output_names):
+        dynamic_axes = defaultdict(list)
+        for name in output_names:
+            dynamic_axes = {
+                **dynamic_axes,
+                **self._extract_dynamic_axes(name, self.output_types[name]),
+            }
+        return dynamic_axes
 
     def export(
         self,
@@ -60,86 +124,88 @@ class Exportable(ABC):
         set_eval: bool = True,
         check_trace: bool = True,
         use_dynamic_axes: bool = True,
+        dynamic_axes=None,
+        check_tolerance=0.01,
+        forward_method=None,
     ):
+        my_args = locals()
+        del my_args['self']
+
+        qual_name = self.__module__ + '.' + self.__class__.__qualname__
+        output_descr = qual_name + ' exported to ONNX'
+
         try:
             # Disable typechecks
             typecheck.set_typecheck_enabled(enabled=False)
+
+            # Allow user to completely override forward method to export
+            if forward_method is None and hasattr(type(self), "forward_for_export"):
+                forward_method = type(self).forward_for_export
+
+            if forward_method:
+                old_forward_method = type(self).forward
+                type(self).forward = forward_method
 
             # Set module to eval mode
             if set_eval:
                 self.eval()
 
-            filename, file_extension = os.path.splitext(output)
-            if file_extension not in _EXT_DICT.keys():
-                raise ValueError(f"Export file {output} extension does not correspond to any export format!")
+            format = self.get_format(output)
 
-            format = _EXT_DICT[file_extension]
+            if input_example is None:
+                input_example = self.input_module.input_example()
 
-            self._prepare_for_export()
+            if isinstance(input_example, Dict):
+                input_example = tuple(input_example.values())
 
-            if input_example is not None:
-                _in_example = input_example
-            else:
-                _in_example = self.input_example()
+            my_args['input_example'] = input_example
+            self._prepare_for_export(**my_args)
 
             if output_example is None:
-                _out_example = self.forward(*_in_example)
+                if isinstance(input_example, tuple):
+                    output_example = self.forward(*input_example)
+                else:
+                    output_example = self.forward(input_example)
 
-            if not (hasattr(self, 'input_types') and hasattr(self, 'output_types')):
-                raise NotImplementedError('For export to work you must define input and output types')
-            input_names = list(self.input_types.keys())
-            output_names = list(self.output_types.keys())
-            # dynamic axis is a mapping from input/output_name => list of "dynamic" indices
-            dynamic_axes = defaultdict(list)
+            input_names = self.input_module.get_input_names(input_example)
+            output_names = self.output_module.get_output_names(output_example)
 
-            # extract dynamic axes and remove unnecessary inputs/outputs
-            # for input_ports
-            for _name, ntype in self.input_types.items():
-                if _name in self.disabled_deployment_input_names:
-                    input_names.remove(_name)
-                    continue
-                if use_dynamic_axes:
-                    dynamic_axes = {**dynamic_axes, **self._extract_dynamic_axes(_name, ntype)}
-            # for output_ports
-            for _name, ntype in self.output_types.items():
-                if _name in self.disabled_deployment_output_names:
-                    output_names.remove(_name)
-                    continue
-                if use_dynamic_axes:
-                    dynamic_axes = {**dynamic_axes, **self._extract_dynamic_axes(_name, ntype)}
-
-            if len(dynamic_axes) == 0:
-                dynamic_axes = None
-
-            with torch.jit.optimized_execution(True):
+            with torch.jit.optimized_execution(True), torch.no_grad():
                 jitted_model = None
                 if try_script:
                     try:
                         jitted_model = torch.jit.script(self)
                     except Exception as e:
                         print("jit.script() failed!", e)
-                if _in_example is None:
-                    raise ValueError(f'Example input is None, but jit.script() has failed or not tried')
 
-                if isinstance(_in_example, Dict):
-                    _in_example = tuple(_in_example.values())
-
-                if jitted_model is None:
-                    jitted_model = torch.jit.trace(self, _in_example, check_trace=check_trace)
-
+            with torch.jit.optimized_execution(True), torch.no_grad():
                 if format == ExportFormat.TORCHSCRIPT:
+                    if jitted_model is None:
+                        jitted_model = torch.jit.trace(
+                            self,
+                            input_example,
+                            strict=False,
+                            optimize=True,
+                            check_trace=check_trace,
+                            check_tolerance=check_tolerance,
+                        )
+                    if verbose:
+                        print(jitted_model.code)
                     jitted_model.save(output)
                     assert os.path.exists(output)
+
                 elif format == ExportFormat.ONNX:
-                    if _out_example is None:
-                        if isinstance(_in_example, tuple):
-                            _out_example = self.forward(*_in_example)
-                        else:
-                            _out_example = self.forward(_in_example)
+                    if jitted_model is None:
+                        jitted_model = self
+
+                    # dynamic axis is a mapping from input/output_name => list of "dynamic" indices
+                    if dynamic_axes is None and use_dynamic_axes:
+                        dynamic_axes = self.input_module.get_input_dynamic_axes(input_names)
+                        dynamic_axes = {**dynamic_axes, **self.output_module.get_output_dynamic_axes(output_names)}
 
                     torch.onnx.export(
                         jitted_model,
-                        _in_example,
+                        input_example,
                         output,
                         input_names=input_names,
                         output_names=output_names,
@@ -149,17 +215,20 @@ class Exportable(ABC):
                         keep_initializers_as_inputs=keep_initializers_as_inputs,
                         dynamic_axes=dynamic_axes,
                         opset_version=onnx_opset_version,
-                        example_outputs=_out_example,
+                        example_outputs=output_example,
                     )
 
                     # Verify the model can be read, and is valid
                     onnx_model = onnx.load(output)
                     onnx.checker.check_model(onnx_model, full_check=True)
-                    return onnx_model
+
                 else:
                     raise ValueError(f'Encountered unknown export format {format}.')
         finally:
             typecheck.set_typecheck_enabled(enabled=True)
+            if forward_method:
+                type(self).forward = old_forward_method
+        return ([output], [output_descr])
 
     @property
     def disabled_deployment_input_names(self):
@@ -200,9 +269,10 @@ class Exportable(ABC):
                     dynamic_axes[name].append(ind)
         return dynamic_axes
 
-    def _prepare_for_export(self):
+    def _prepare_for_export(self, **kwargs):
         """
         Override this method to prepare module for export. This is in-place operation.
         Base version does common necessary module replacements (Apex etc)
         """
-        replace_for_export(self)
+        replace_1D_2D = kwargs.get('replace_1D_2D', False)
+        replace_for_export(self, replace_1D_2D)

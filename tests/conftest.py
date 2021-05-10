@@ -16,20 +16,21 @@ import tarfile
 import urllib.request
 from os import mkdir
 from os.path import dirname, exists, getsize, join
+from pathlib import Path
 from shutil import rmtree
 
 import pytest
 
 # Those variables probably should go to main NeMo configuration file (config.yaml).
 __TEST_DATA_FILENAME = "test_data.tar.gz"
-__TEST_DATA_URL = "https://github.com/NVIDIA/NeMo/releases/download/v0.11.0/"
+__TEST_DATA_URL = "https://github.com/NVIDIA/NeMo/releases/download/v1.0.0rc1/"
 __TEST_DATA_SUBDIR = ".data"
 
 
 def pytest_addoption(parser):
     """
     Additional command-line arguments passed to pytest.
-    For now: 
+    For now:
         --cpu: use CPU during testing (DEFAULT: GPU)
         --use_local_test_data: use local test data/skip downloading from URL/GitHub (DEFAULT: False)
     """
@@ -40,6 +41,11 @@ def pytest_addoption(parser):
         '--use_local_test_data',
         action='store_true',
         help="pass that argument to use local test data/skip downloading from URL/GitHub (DEFAULT: False)",
+    )
+    parser.addoption(
+        '--with_downloads',
+        action='store_true',
+        help="pass this argument to active tests which download models from the cloud.",
     )
 
 
@@ -59,10 +65,30 @@ def run_only_on_device_fixture(request, device):
             pytest.skip('skipped on this device: {}'.format(device))
 
 
-def pytest_configure(config):
-    config.addinivalue_line(
-        "markers", "run_only_on(device): runs the test only on a given device [CPU | GPU]",
-    )
+@pytest.fixture(autouse=True)
+def downloads_weights(request, device):
+    if request.node.get_closest_marker('with_downloads'):
+        if not request.config.getoption("--with_downloads"):
+            pytest.skip(
+                'To run this test, pass --with_downloads option. It will download (and cache) models from cloud.'
+            )
+
+
+@pytest.fixture(autouse=True)
+def cleanup_local_folder():
+    # Asserts in fixture are not recommended, but I'd rather stop users from deleting expensive training runs
+    assert not Path("./lightning_logs").exists()
+    assert not Path("./NeMo_experiments").exists()
+    assert not Path("./nemo_experiments").exists()
+
+    yield
+
+    if Path("./lightning_logs").exists():
+        rmtree('./lightning_logs', ignore_errors=True)
+    if Path("./NeMo_experiments").exists():
+        rmtree('./NeMo_experiments', ignore_errors=True)
+    if Path("./nemo_experiments").exists():
+        rmtree('./nemo_experiments', ignore_errors=True)
 
 
 @pytest.fixture
@@ -80,6 +106,9 @@ def pytest_configure(config):
     If so, compares its size with github's test_data.tar.gz.
     If file absent or sizes not equal, function downloads the archive from github and unpacks it.
     """
+    config.addinivalue_line(
+        "markers", "run_only_on(device): runs the test only on a given device [CPU | GPU]",
+    )
     # Test dir and archive filepath.
     test_dir = join(dirname(__file__), __TEST_DATA_SUBDIR)
     test_data_archive = join(dirname(__file__), __TEST_DATA_SUBDIR, __TEST_DATA_FILENAME)

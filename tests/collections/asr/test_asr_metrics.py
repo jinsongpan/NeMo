@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from nemo.collections.asr.metrics.wer import WER, word_error_rate
+from nemo.collections.asr.parts.rnnt_utils import Hypothesis
 from nemo.utils import logging
 
 
@@ -80,16 +81,15 @@ class TestWordErrorRate:
         return torch.Tensor(string_in_id_form).unsqueeze(0)
 
     def get_wer(self, wer, prediction: str, reference: str):
-        res = (
-            wer(
-                predictions=self.__string_to_ctc_tensor(prediction),
-                targets=self.__reference_string_to_tensor(reference),
-                target_lengths=torch.tensor([len(reference)]),
-            )
-            .detach()
-            .cpu()
+        wer(
+            predictions=self.__string_to_ctc_tensor(prediction),
+            targets=self.__reference_string_to_tensor(reference),
+            target_lengths=torch.tensor([len(reference)]),
         )
-        return res[0] / res[1]
+        res, _, _ = wer.compute()
+        res = res.detach().cpu()
+        # return res[0] / res[1]
+        return res.item()
 
     @pytest.mark.unit
     def test_wer_function(self):
@@ -109,7 +109,7 @@ class TestWordErrorRate:
         assert self.get_wer(wer, 'g p u', 'gpu') == 3.0
         assert self.get_wer(wer, 'ducati motorcycle', 'motorcycle') == 1.0
         assert self.get_wer(wer, 'ducati motorcycle', 'ducuti motorcycle') == 0.5
-        assert self.get_wer(wer, 'a f c', 'a b c') == 1.0 / 3.0
+        assert abs(self.get_wer(wer, 'a f c', 'a b c') - 1.0 / 3.0) < 1e-6
 
     @pytest.mark.unit
     def test_wer_metric_randomized(self):
@@ -125,5 +125,50 @@ class TestWordErrorRate:
             n2 = random.randint(1, 512)
             s1 = __randomString(n1)
             s2 = __randomString(n2)
-            # Floating-point math doesn't seem to be an issue here. Leaving as ==
-            assert self.get_wer(wer, prediction=s1, reference=s2) == word_error_rate(hypotheses=[s1], references=[s2])
+            # skip empty strings as reference
+            if s2.strip():
+                assert (
+                    abs(
+                        self.get_wer(wer, prediction=s1, reference=s2)
+                        - word_error_rate(hypotheses=[s1], references=[s2])
+                    )
+                    < 1e-6
+                )
+
+    @pytest.mark.unit
+    def test_wer_metric_decode(self):
+        wer = WER(vocabulary=self.vocabulary, batch_dim_index=0, use_cer=False, ctc_decode=True)
+
+        tokens = self.__string_to_ctc_tensor('cat')[0].int().numpy().tolist()
+        assert tokens == [3, 1, 20]
+
+        tokens_decoded = wer.decode_ids_to_tokens(tokens)
+        assert tokens_decoded == ['c', 'a', 't']
+
+        str_decoded = wer.decode_tokens_to_str(tokens)
+        assert str_decoded == 'cat'
+
+    @pytest.mark.unit
+    def test_wer_metric_return_hypothesis(self):
+        wer = WER(vocabulary=self.vocabulary, batch_dim_index=0, use_cer=False, ctc_decode=True)
+
+        tensor = self.__string_to_ctc_tensor('cat').int()
+
+        # pass batchsize 1 tensor, get back list of length 1 Hypothesis
+        hyp = wer.ctc_decoder_predictions_tensor(tensor, return_hypotheses=True)
+        hyp = hyp[0]
+        assert isinstance(hyp, Hypothesis)
+
+        assert hyp.y_sequence is None
+        assert hyp.score == -1.0
+        assert hyp.text == 'cat'
+        assert hyp.alignments == [3, 1, 20]
+        assert hyp.length == 0
+
+        length = torch.tensor([tensor.shape[-1]], dtype=torch.long)
+
+        # pass batchsize 1 tensor, get back list of length 1 Hypothesis [add length info]
+        hyp = wer.ctc_decoder_predictions_tensor(tensor, predictions_len=length, return_hypotheses=True)
+        hyp = hyp[0]
+        assert isinstance(hyp, Hypothesis)
+        assert hyp.length == 3

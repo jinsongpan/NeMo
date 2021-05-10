@@ -29,6 +29,7 @@ __all__ = [
     'MFCCSpectrogramType',
     'LogitsType',
     'LabelsType',
+    'HypothesisType',
     'LossType',
     'RegressionValuesType',
     'CategoricalValuesType',
@@ -49,9 +50,11 @@ __all__ = [
     'TokenIndex',
     'Length',
     'IntType',
+    'FloatType',
     'NormalDistributionSamplesType',
     'NormalDistributionMeanType',
     'NormalDistributionLogVarianceType',
+    'TokenDurationType',
     'TokenLogDurationType',
     'LogDeterminantType',
     'SequenceToSequenceAlignmentType',
@@ -63,7 +66,7 @@ class ElementType(ABC):
     We are relying on Python for inheritance checking"""
 
     def __str__(self):
-        self.__doc__
+        return self.__doc__
 
     def __repr__(self):
         return self.__class__.__name__
@@ -107,6 +110,9 @@ class ElementType(ABC):
                 return NeuralTypeComparisonResult.SAME_TYPE_INCOMPATIBLE_PARAMS
             else:
                 for k1, v1 in self.type_parameters.items():
+                    if v1 is None or second.type_parameters[k1] is None:
+                        # Treat None as Void
+                        continue
                     if v1 != second.type_parameters[k1]:
                         return NeuralTypeComparisonResult.SAME_TYPE_INCOMPATIBLE_PARAMS
             # check that all fields match
@@ -150,6 +156,11 @@ class LabelsType(ElementType):
     a more concrete types such as RegressionValuesType, etc."""
 
 
+class HypothesisType(LabelsType):
+    """Element type to represent some decoded hypothesis, which may further be processed to obtain
+    a concrete label."""
+
+
 class LengthsType(ElementType):
     """Element type representing lengths of something"""
 
@@ -173,7 +184,7 @@ class AudioSignal(ElementType):
         freq is the same.
     """
 
-    def __init__(self, freq: int = 16000):
+    def __init__(self, freq: int = None):
         self._params = {}
         self._params['freq'] = freq
 
@@ -262,6 +273,10 @@ class IntType(ElementType):
     """Element type representing a single integer"""
 
 
+class FloatType(ElementType):
+    """Element type representing a single float"""
+
+
 class TokenIndex(IntType):
     """Type representing an element being index of a token in some kind of a vocabulary."""
 
@@ -291,6 +306,10 @@ class NormalDistributionMeanType(ElementType):
 
 class NormalDistributionLogVarianceType(ElementType):
     """Element to represent the log variance of a normal distribution"""
+
+
+class TokenDurationType(ElementType):
+    """Element for representing the duration of a token"""
 
 
 class TokenLogDurationType(ElementType):

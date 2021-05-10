@@ -15,7 +15,7 @@
 # limitations under the License.
 
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import numpy as np
 import torch
@@ -28,7 +28,6 @@ from nemo.collections.nlp.models.glue_benchmark.metrics_for_glue import compute_
 from nemo.collections.nlp.models.nlp_model import NLPModel
 from nemo.collections.nlp.modules.common import SequenceClassifier, SequenceRegression
 from nemo.collections.nlp.modules.common.lm_utils import get_lm_model
-from nemo.collections.nlp.modules.common.tokenizer_utils import get_tokenizer
 from nemo.collections.nlp.parts.utils_funcs import list2str, tensor2list
 from nemo.core.classes import typecheck
 from nemo.core.neural_types import NeuralType
@@ -76,38 +75,35 @@ class GLUEModel(NLPModel):
         """
         Initializes model to use BERT model for GLUE tasks.
         """
-        self.data_dir = cfg.dataset.data_dir
-        if not os.path.exists(self.data_dir):
-            raise FileNotFoundError(
-                "GLUE datasets not found. For more details on how to get the data, see: "
-                "https://gist.github.com/W4ngatang/60c2bdb54d156a41194446737ce03e2e"
-            )
 
         if cfg.task_name not in cfg.supported_tasks:
             raise ValueError(f'{cfg.task_name} not in supported task. Choose from {cfg.supported_tasks}')
         self.task_name = cfg.task_name
 
+        # needed to setup validation on multiple datasets
         # MNLI task has two separate dev sets: matched and mismatched
-        cfg.train_ds.file_name = os.path.join(self.data_dir, cfg.train_ds.file_name)
-        if self.task_name == "mnli":
-            cfg.validation_ds.file_name = [
-                os.path.join(self.data_dir, 'dev_matched.tsv'),
-                os.path.join(self.data_dir, 'dev_mismatched.tsv'),
-            ]
-        else:
-            cfg.validation_ds.file_name = os.path.join(self.data_dir, cfg.validation_ds.file_name)
-        logging.info(f'Using {cfg.validation_ds.file_name} for model evaluation.')
-        self._setup_tokenizer(cfg.tokenizer)
+        if not self._is_model_being_restored():
+            if self.task_name == "mnli":
+                cfg.validation_ds.ds_item = [
+                    os.path.join(cfg.dataset.data_dir, 'dev_matched.tsv'),
+                    os.path.join(cfg.dataset.data_dir, 'dev_mismatched.tsv'),
+                ]
+            else:
+                cfg.validation_ds.ds_item = os.path.join(cfg.dataset.data_dir, cfg.validation_ds.ds_item)
+            cfg.train_ds.ds_item = os.path.join(cfg.dataset.data_dir, cfg.train_ds.ds_item)
+            logging.info(f'Using {cfg.validation_ds.ds_item} for model evaluation.')
 
+        self.setup_tokenizer(cfg.tokenizer)
         super().__init__(cfg=cfg, trainer=trainer)
 
         num_labels = GLUE_TASKS_NUM_LABELS[self.task_name]
 
         self.bert_model = get_lm_model(
             pretrained_model_name=cfg.language_model.pretrained_model_name,
-            config_file=cfg.language_model.config_file,
+            config_file=self.register_artifact('language_model.config_file', cfg.language_model.config_file),
             config_dict=OmegaConf.to_container(cfg.language_model.config) if cfg.language_model.config else None,
             checkpoint_file=cfg.language_model.lm_checkpoint,
+            vocab_file=self.register_artifact('tokenizer.vocab_file', cfg.tokenizer.vocab_file),
         )
 
         # uses [CLS] token for classification (the first token)
@@ -120,8 +116,26 @@ class GLUEModel(NLPModel):
             )
             self.loss = CrossEntropyLoss()
 
-        # Optimizer setup needs to happen after all model weights are ready
-        self.setup_optimization(cfg.optim)
+    def update_data_dir(self, data_dir: str) -> None:
+        """
+        Update data directory and get data stats with Data Descriptor
+        Weights are later used to setup loss
+
+        Args:
+            data_dir: path to data directory
+        """
+        self._cfg.dataset.data_dir = data_dir
+        logging.info(f'Setting model.dataset.data_dir to {data_dir}.')
+        if self.task_name == "mnli":
+            self._cfg.validation_ds.ds_item = [
+                os.path.join(data_dir, 'dev_matched.tsv'),
+                os.path.join(data_dir, 'dev_mismatched.tsv'),
+            ]
+        else:
+            self._cfg.validation_ds.ds_item = os.path.join(data_dir, 'dev.tsv')
+
+        self._cfg.train_ds.ds_item = os.path.join(data_dir, 'train.tsv')
+        logging.info(f'Using {self._cfg.validation_ds.ds_item} for model evaluation.')
 
     @typecheck()
     def forward(self, input_ids, token_type_ids, attention_mask):
@@ -139,8 +153,16 @@ class GLUEModel(NLPModel):
             loss = self.loss(preds=model_output, labels=labels)
         else:
             loss = self.loss(logits=model_output, labels=labels)
-        tensorboard_logs = {'train_loss': loss, 'lr': self._optimizer.param_groups[0]['lr']}
-        return {'loss': loss, 'log': tensorboard_logs}
+
+        lr = self._optimizer.param_groups[0]['lr']
+
+        self.log('train_loss', loss)
+        self.log('lr', lr, prog_bar=True)
+
+        return {
+            'loss': loss,
+            'lr': lr,
+        }
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         input_ids, input_type_ids, input_mask, labels = batch
@@ -155,8 +177,7 @@ class GLUEModel(NLPModel):
             model_output = torch.argmax(model_output, 1)
 
         eval_tensors = {'preds': model_output, 'labels': labels}
-        tensorboard_logs = {'val_loss': val_loss}
-        return {'val_loss': val_loss, 'log': tensorboard_logs, 'eval_tensors': eval_tensors}
+        return {'val_loss': val_loss, 'eval_tensors': eval_tensors}
 
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
         """
@@ -190,42 +211,53 @@ class GLUEModel(NLPModel):
                 labels.extend(tensor2list(l))
 
             tensorboard_logs = compute_metrics(self.task_name, np.array(preds), np.array(labels))
-            logging.info(f'{self._validation_names[dataloader_idx].upper()} evaluation: {tensorboard_logs}')
+            val_name = self._validation_names[dataloader_idx].upper()
+            logging.info(f'{val_name} evaluation: {tensorboard_logs}')
 
             # writing labels and predictions to a file in output_dir is specified in the config
             output_dir = self._cfg.output_dir
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
-                filename = os.path.join(output_dir, self.task_name + '.txt')
+                filename = os.path.join(output_dir, f'{self.task_name}_{val_name}.txt')
                 logging.info(f'Saving labels and predictions to {filename}')
                 with open(filename, 'w') as f:
                     f.write('labels\t' + list2str(labels) + '\n')
                     f.write('preds\t' + list2str(preds) + '\n')
 
         tensorboard_logs['val_loss'] = avg_loss
+        for key in tensorboard_logs:
+            self.log(f'{key}', tensorboard_logs[key], prog_bar=True)
+
         return {'val_loss': avg_loss, 'log': tensorboard_logs}
 
-    def _setup_tokenizer(self, cfg: DictConfig):
-        tokenizer = get_tokenizer(
-            tokenizer_name=cfg.tokenizer_name,
-            tokenizer_model=cfg.tokenizer_model,
-            special_tokens=OmegaConf.to_container(cfg.special_tokens) if cfg.special_tokens else None,
-            vocab_file=cfg.vocab_file,
-        )
-        self.tokenizer = tokenizer
+    def setup_training_data(self, train_data_config: Optional[DictConfig] = None):
+        if train_data_config is None:
+            train_data_config = self._cfg.train_ds
 
-    def setup_training_data(self, train_data_config: Optional[DictConfig]):
         self._train_dl = self._setup_dataloader_from_config(cfg=train_data_config)
 
-    def setup_validation_data(self, val_data_config: Optional[DictConfig]):
+    def setup_validation_data(self, val_data_config: Optional[DictConfig] = None):
+        if val_data_config is None:
+            val_data_config = self._cfg.validation_ds
+
         self._validation_dl = self._setup_dataloader_from_config(cfg=val_data_config)
 
-    def setup_test_data(self, test_data_config: Optional[DictConfig]):
-        self._test_dl = self.__setup_dataloader_from_config(cfg=test_data_config)
+    def setup_multiple_validation_data(self, val_data_config: Union[DictConfig, Dict] = None):
+        if val_data_config is None:
+            val_data_config = self._cfg.validation_ds
+
+        return super().setup_multiple_validation_data(val_data_config)
 
     def _setup_dataloader_from_config(self, cfg: DictConfig):
+        file_name = cfg.ds_item
+        if not os.path.exists(file_name):
+            raise FileNotFoundError(
+                "GLUE datasets not found. For more details on how to get the data, see: "
+                "https://gist.github.com/W4ngatang/60c2bdb54d156a41194446737ce03e2e"
+            )
+
         dataset = GLUEDataset(
-            file_name=cfg.file_name,
+            file_name=file_name,
             task_name=self.task_name,
             tokenizer=self.tokenizer,
             max_seq_length=self._cfg.dataset.max_seq_length,

@@ -18,15 +18,16 @@ from typing import Any, Dict, Optional
 import torch
 from hydra.utils import instantiate
 from omegaconf import MISSING, DictConfig, OmegaConf, open_dict
+from pytorch_lightning.loggers import LoggerCollection, TensorBoardLogger
 
-from nemo.collections.tts.helpers.helpers import waveglow_log_to_tb_func
+from nemo.collections.tts.helpers.helpers import OperationMode, waveglow_log_to_tb_func
 from nemo.collections.tts.losses.waveglowloss import WaveGlowLoss
-from nemo.collections.tts.models.base import Vocoder
-from nemo.collections.tts.modules.squeezewave import OperationMode
+from nemo.collections.tts.models.base import GlowVocoder
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.neural_types.elements import (
     AudioSignal,
     LengthsType,
+    LogDeterminantType,
     MelSpectrogramType,
     NormalDistributionSamplesType,
     VoidType,
@@ -36,26 +37,15 @@ from nemo.utils import logging
 
 
 @dataclass
-class PreprocessorParams:
-    pad_value: float = MISSING
-
-
-@dataclass
-class Preprocessor:
-    cls: str = MISSING
-    params: PreprocessorParams = PreprocessorParams()
-
-
-@dataclass
 class SqueezeWaveConfig:
     squeezewave: Dict[Any, Any] = MISSING
-    preprocessor: Preprocessor = Preprocessor()
+    preprocessor: Dict[Any, Any] = MISSING
     sigma: float = MISSING
     train_ds: Optional[Dict[Any, Any]] = None
     validation_ds: Optional[Dict[Any, Any]] = None
 
 
-class SqueezeWaveModel(Vocoder):
+class SqueezeWaveModel(GlowVocoder):
     """ SqueezeWave model that generates audio conditioned on mel-spectrogram
     """
 
@@ -73,12 +63,19 @@ class SqueezeWaveModel(Vocoder):
         # Ensure passed cfg is compliant with schema
         OmegaConf.merge(cfg, schema)
 
-        self.pad_value = self._cfg.preprocessor.params.pad_value
         self.sigma = self._cfg.sigma
         self.audio_to_melspec_precessor = instantiate(self._cfg.preprocessor)
         self.squeezewave = instantiate(self._cfg.squeezewave)
-        self.mode = OperationMode.infer
         self.loss = WaveGlowLoss()  # Same loss as WaveGlow
+
+    @GlowVocoder.mode.setter
+    def mode(self, new_mode):
+        if new_mode == OperationMode.training:
+            self.train()
+        else:
+            self.eval()
+        self._mode = new_mode
+        self.squeezewave.mode = new_mode
 
     @property
     def input_types(self):
@@ -93,8 +90,8 @@ class SqueezeWaveModel(Vocoder):
         if self.mode == OperationMode.training or self.mode == OperationMode.validation:
             output_dict = {
                 "pred_normal_dist": NeuralType(('B', 'flowgroup', 'T'), NormalDistributionSamplesType()),
-                "log_s_list": NeuralType(('B', 'flowgroup', 'T'), VoidType()),  # TODO: Figure out a good typing
-                "log_det_W_list": NeuralType(elements_type=VoidType()),  # TODO: Figure out a good typing
+                "log_s_list": [NeuralType(('B', 'flowgroup', 'T'), VoidType())],  # TODO: Figure out a good typing
+                "log_det_W_list": [NeuralType(elements_type=LogDeterminantType())],
             }
             if self.mode == OperationMode.validation:
                 output_dict["audio_pred"] = NeuralType(('B', 'T'), AudioSignal())
@@ -121,22 +118,27 @@ class SqueezeWaveModel(Vocoder):
         return tensors  # audio_pred
 
     @typecheck(
-        input_types={"spec": NeuralType(('B', 'D', 'T'), MelSpectrogramType()), "sigma": NeuralType(optional=True)},
+        input_types={
+            "spec": NeuralType(('B', 'D', 'T'), MelSpectrogramType()),
+            "sigma": NeuralType(optional=True),
+            "denoise": NeuralType(optional=True),
+            "denoiser_strength": NeuralType(optional=True),
+        },
         output_types={"audio": NeuralType(('B', 'T'), AudioSignal())},
     )
-    def convert_spectrogram_to_audio(self, spec: torch.Tensor, sigma: bool = 1.0) -> torch.Tensor:
-        self.eval()
-        self.mode = OperationMode.infer
-        self.squeezewave.mode = OperationMode.infer
-
-        with torch.no_grad():
+    def convert_spectrogram_to_audio(
+        self, spec: torch.Tensor, sigma: bool = 1.0, denoise: bool = True, denoiser_strength: float = 0.01
+    ) -> torch.Tensor:
+        with self.nemo_infer():
             audio = self.squeezewave(spec=spec, run_inverse=True, audio=None, sigma=sigma)
+            if denoise:
+                audio = self.denoise(audio=audio, strength=denoiser_strength)
 
         return audio
 
     def training_step(self, batch, batch_idx):
         self.mode = OperationMode.training
-        self.squeezewave.mode = OperationMode.training
+
         audio, audio_len = batch
         z, log_s_list, log_det_W_list = self.forward(audio=audio, audio_len=audio_len, run_inverse=False)
 
@@ -149,7 +151,7 @@ class SqueezeWaveModel(Vocoder):
 
     def validation_step(self, batch, batch_idx):
         self.mode = OperationMode.validation
-        self.squeezewave.mode = OperationMode.validation
+
         audio, audio_len = batch
         z, log_s_list, log_det_W_list, audio_pred, spec, spec_len = self.forward(
             audio=audio, audio_len=audio_len, run_inverse=(batch_idx == 0)
@@ -164,22 +166,27 @@ class SqueezeWaveModel(Vocoder):
 
     def validation_epoch_end(self, outputs):
         if self.logger is not None and self.logger.experiment is not None:
+            tb_logger = self.logger.experiment
+            if isinstance(self.logger, LoggerCollection):
+                for logger in self.logger:
+                    if isinstance(logger, TensorBoardLogger):
+                        tb_logger = logger.experiment
+                        break
             waveglow_log_to_tb_func(
-                self.logger.experiment,
+                tb_logger,
                 outputs[0].values(),
                 self.global_step,
                 tag="eval",
                 mel_fb=self.audio_to_melspec_precessor.fb,
             )
         avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean()
-        tensorboard_logs = {'val_loss': avg_loss}
-        return {'val_loss': avg_loss, 'log': tensorboard_logs}
+        self.log('val_loss', avg_loss)
 
     def __setup_dataloader_from_config(self, cfg, shuffle_should_be: bool = True, name: str = "train"):
         if "dataset" not in cfg or not isinstance(cfg.dataset, DictConfig):
-            raise ValueError(f"No dataset for {name}")  # TODO
+            raise ValueError(f"No dataset for {name}")
         if "dataloader_params" not in cfg or not isinstance(cfg.dataloader_params, DictConfig):
-            raise ValueError(f"No dataloder_params for {name}")  # TODO
+            raise ValueError(f"No dataloder_params for {name}")
         if shuffle_should_be:
             if 'shuffle' not in cfg.dataloader_params:
                 logging.warning(
@@ -211,9 +218,9 @@ class SqueezeWaveModel(Vocoder):
         """
         list_of_models = []
         model = PretrainedModelInfo(
-            pretrained_model_name="SqueezeWave-22050Hz",
-            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemottsmodels/versions/1.0.0a5/files/SqueezeWave-22050Hz.nemo",
-            description="This model is trained on LJSpeech sampled at 22050Hz, and can be used as an universal vocoder.",
+            pretrained_model_name="tts_squeezewave",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/tts_squeezewave/versions/1.0.0rc1/files/tts_squeezewave.nemo",
+            description="This model is trained on LJSpeech sampled at 22050Hz, and has been tested on generating female English voices with an American accent.",
             class_=cls,
         )
         list_of_models.append(model)

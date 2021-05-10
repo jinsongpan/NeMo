@@ -16,9 +16,8 @@
 import os
 from typing import Dict, List, Optional
 
-import onnx
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from pytorch_lightning import Trainer
 
 from nemo.collections.common.losses import CrossEntropyLoss
@@ -27,13 +26,11 @@ from nemo.collections.nlp.metrics.classification_report import ClassificationRep
 from nemo.collections.nlp.models.nlp_model import NLPModel
 from nemo.collections.nlp.modules.common import SequenceClassifier
 from nemo.collections.nlp.modules.common.lm_utils import get_lm_model
-from nemo.collections.nlp.modules.common.tokenizer_utils import get_tokenizer
 from nemo.collections.nlp.parts.utils_funcs import tensor2list
 from nemo.core.classes.common import typecheck
 from nemo.core.classes.exportable import Exportable
 from nemo.core.neural_types import NeuralType
 from nemo.utils import logging
-from nemo.utils.export_utils import attach_onnx_to_onnx
 
 __all__ = ['TextClassificationModel']
 
@@ -54,16 +51,18 @@ class TextClassificationModel(NLPModel, Exportable):
         self.dataset_cfg = cfg.dataset
         # tokenizer needs to get initialized before the super.__init__()
         # as dataloaders and datasets need it to process the data
-        self._setup_tokenizer(cfg.tokenizer)
+        self.setup_tokenizer(cfg.tokenizer)
 
-        # init superclass
+        self.class_weights = None
+
         super().__init__(cfg=cfg, trainer=trainer)
 
         self.bert_model = get_lm_model(
             pretrained_model_name=cfg.language_model.pretrained_model_name,
-            config_file=cfg.language_model.config_file,
+            config_file=self.register_artifact('language_model.config_file', cfg.language_model.config_file),
             config_dict=cfg.language_model.config,
             checkpoint_file=cfg.language_model.lm_checkpoint,
+            vocab_file=self.register_artifact('tokenizer.vocab_file', cfg.tokenizer.vocab_file),
         )
 
         self.classifier = SequenceClassifier(
@@ -77,32 +76,25 @@ class TextClassificationModel(NLPModel, Exportable):
             idx_conditioned_on=0,
         )
 
-        class_weights = None
-        if cfg.dataset.class_balancing == 'weighted_loss':
-            if cfg.train_ds.file_path:
-                class_weights = calc_class_weights(cfg.train_ds.file_path, cfg.dataset.num_classes)
-            else:
-                logging.info(
-                    'Class_balancing feature is enabled but no train file is given. Calculating the class weights is skipped.'
-                )
-
-        if class_weights:
-            # You may need to increase the number of epochs for convergence when using weighted_loss
-            self.loss = CrossEntropyLoss(weight=class_weights)
-        else:
-            self.loss = CrossEntropyLoss()
+        self.create_loss_module()
 
         # setup to track metrics
-        self.classification_report = ClassificationReport(cfg.dataset.num_classes)
-
-    def _setup_tokenizer(self, cfg: DictConfig):
-        tokenizer = get_tokenizer(
-            tokenizer_name=cfg.tokenizer_name,
-            vocab_file=self.register_artifact(config_path='tokenizer.vocab_file', src=cfg.vocab_file),
-            special_tokens=OmegaConf.to_container(cfg.special_tokens) if cfg.special_tokens else None,
-            tokenizer_model=self.register_artifact(config_path='tokenizer.tokenizer_model', src=cfg.tokenizer_model),
+        self.classification_report = ClassificationReport(
+            num_classes=cfg.dataset.num_classes, mode='micro', dist_sync_on_step=True
         )
-        self.tokenizer = tokenizer
+
+        # register the file containing the labels into the artifacts to get stored in the '.nemo' file later
+        if 'class_labels' in cfg and 'class_labels_file' in cfg.class_labels and cfg.class_labels.class_labels_file:
+            self.register_artifact('class_labels', cfg.class_labels.class_labels_file)
+
+    def create_loss_module(self):
+        # create the loss module if it is not yet created by the training data loader
+        if not hasattr(self, 'loss'):
+            if hasattr(self, 'class_weights') and self.class_weights:
+                # You may need to increase the number of epochs for convergence when using weighted_loss
+                self.loss = CrossEntropyLoss(weight=self.class_weights)
+            else:
+                self.loss = CrossEntropyLoss()
 
     @typecheck()
     def forward(self, input_ids, token_type_ids, attention_mask):
@@ -127,30 +119,31 @@ class TextClassificationModel(NLPModel, Exportable):
 
         train_loss = self.loss(logits=logits, labels=labels)
 
-        tensorboard_logs = {'train_loss': train_loss, 'lr': self._optimizer.param_groups[0]['lr']}
-        return {'loss': train_loss, 'log': tensorboard_logs}
+        lr = self._optimizer.param_groups[0]['lr']
+
+        self.log('train_loss', train_loss)
+        self.log('lr', lr, prog_bar=True)
+
+        return {
+            'loss': train_loss,
+            'lr': lr,
+        }
 
     def validation_step(self, batch, batch_idx):
         """
         Lightning calls this inside the validation loop with the data from the validation dataloader
         passed in as `batch`.
         """
-        if self.testing:
-            prefix = 'test'
-        else:
-            prefix = 'val'
-
         input_ids, input_type_ids, input_mask, labels = batch
         logits = self.forward(input_ids=input_ids, token_type_ids=input_type_ids, attention_mask=input_mask)
 
         val_loss = self.loss(logits=logits, labels=labels)
 
         preds = torch.argmax(logits, axis=-1)
-        tp, fp, fn = self.classification_report(preds, labels)
 
-        tensorboard_logs = {f'{prefix}_loss': val_loss, f'{prefix}_tp': tp, f'{prefix}_fn': fn, f'{prefix}_fp': fp}
+        tp, fn, fp, _ = self.classification_report(preds, labels)
 
-        return {f'{prefix}_loss': val_loss, 'log': tensorboard_logs}
+        return {'val_loss': val_loss, 'tp': tp, 'fn': fn, 'fp': fp}
 
     def validation_epoch_end(self, outputs):
         """
@@ -164,20 +157,17 @@ class TextClassificationModel(NLPModel, Exportable):
         else:
             prefix = 'val'
 
-        avg_loss = torch.stack([x[f'{prefix}_loss'] for x in outputs]).mean()
-        # calculate metrics and log classification report
-        tp = torch.sum(torch.stack([x['log'][f'{prefix}_tp'] for x in outputs]), 0)
-        fn = torch.sum(torch.stack([x['log'][f'{prefix}_fn'] for x in outputs]), 0)
-        fp = torch.sum(torch.stack([x['log'][f'{prefix}_fp'] for x in outputs]), 0)
-        precision, recall, f1 = self.classification_report.get_precision_recall_f1(tp, fn, fp, mode='micro')
+        avg_loss = torch.stack([x[f'val_loss'] for x in outputs]).mean()
 
-        tensorboard_logs = {
-            f'{prefix}_loss': avg_loss,
-            f'{prefix}_precision': precision,
-            f'{prefix}_recall': recall,
-            f'{prefix}_f1': f1,
-        }
-        return {f'{prefix}_loss': avg_loss, 'log': tensorboard_logs}
+        # calculate metrics and classification report
+        precision, recall, f1, report = self.classification_report.compute()
+
+        logging.info(f'{prefix}_report: {report}')
+
+        self.log(f'{prefix}_loss', avg_loss, prog_bar=True)
+        self.log(f'{prefix}_precision', precision)
+        self.log(f'{prefix}_f1', f1)
+        self.log(f'{prefix}_recall', recall)
 
     def test_step(self, batch, batch_idx):
         """
@@ -201,6 +191,14 @@ class TextClassificationModel(NLPModel, Exportable):
             self._test_dl = None
             return
         self._train_dl = self._setup_dataloader_from_config(cfg=train_data_config)
+
+        # calculate the class weights to be used in the loss function
+        if self.cfg.dataset.class_balancing == 'weighted_loss':
+            self.class_weights = calc_class_weights(train_data_config.file_path, self.cfg.dataset.num_classes)
+        else:
+            self.class_weights = None
+        # we need to create/update the loss module by using the weights calculated from the training data
+        self.create_loss_module()
 
     def setup_validation_data(self, val_data_config: Optional[DictConfig]):
         if not val_data_config or not val_data_config.file_path:
@@ -322,61 +320,3 @@ class TextClassificationModel(NLPModel, Exportable):
     @classmethod
     def from_pretrained(cls, name: str):
         pass
-
-    def _prepare_for_export(self):
-        return self.bert_model._prepare_for_export()
-
-    def export(
-        self,
-        output: str,
-        input_example=None,
-        output_example=None,
-        verbose=False,
-        export_params=True,
-        do_constant_folding=True,
-        keep_initializers_as_inputs=False,
-        onnx_opset_version: int = 12,
-        try_script: bool = False,
-        set_eval: bool = True,
-        check_trace: bool = True,
-        use_dynamic_axes: bool = True,
-    ):
-        if input_example is not None or output_example is not None:
-            logging.warning(
-                "Passed input and output examples will be ignored and recomputed since"
-                " TextClassificationModel consists of two separate models with different"
-                " inputs and outputs."
-            )
-
-        bert_model_onnx = self.bert_model.export(
-            'bert_' + output,
-            None,  # computed by input_example()
-            None,
-            verbose,
-            export_params,
-            do_constant_folding,
-            keep_initializers_as_inputs,
-            onnx_opset_version,
-            try_script,
-            set_eval,
-            check_trace,
-            use_dynamic_axes,
-        )
-
-        classifier_onnx = self.classifier.export(
-            'classifier_' + output,
-            None,  # computed by input_example()
-            None,
-            verbose,
-            export_params,
-            do_constant_folding,
-            keep_initializers_as_inputs,
-            onnx_opset_version,
-            try_script,
-            set_eval,
-            check_trace,
-            use_dynamic_axes,
-        )
-
-        output_model = attach_onnx_to_onnx(bert_model_onnx, classifier_onnx, "CL")
-        onnx.save(output_model, output)

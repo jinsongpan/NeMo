@@ -1,8 +1,8 @@
-name: &name "DeepGriffinLim"
-sample_rate: &sr 22050
-n_fft: &n_fft 1024
-hop_length: &hop_length 256
-destination: &destination "/tmp"
+name: "DeepGriffinLim"
+sample_rate: 22050
+n_fft: 1024
+hop_length: 256
+destination: "/tmp"
 
 model:
   train_ds:
@@ -54,7 +54,7 @@ model:
     k_y: 3
     s_x: 1
     s_y: 2
-    widening: 16 
+    widening: 16
     use_bn: False
     linear_finalizer: True
     convGlu: False
@@ -68,7 +68,7 @@ model:
     name: novograd
     lr: 0.01
     weight_decay: 0.001
-    
+
     sched:
       name: ReduceLROnPlateau
       mode: min
@@ -84,24 +84,24 @@ model:
   train_params:
     repeat_training: 2
     repeat_validation: 32
-    sampling_rate: *sr
+    sampling_rate: ${sample_rate}
 
 trainer:
   gpus: 1 # number of gpus
   max_epochs: 200
   num_nodes: 1
-  distributed_backend: ddp
+  accelerator: ddp
   accumulate_grad_batches: 1
   checkpoint_callback: False  # Provided by exp_manager
   logger: False  # Provided by exp_manager
-  log_save_interval: 2000
-  row_log_interval: 200
+  flush_logs_every_n_steps: 2000
+  log_every_n_steps: 200
   check_val_every_n_epoch: 5
   precision: 32
   gradient_clip_val: 4.0
 
 exp_manager:
   exp_dir: null
-  name: *name
+  name: ${name}
   create_tensorboard_logger: True
   create_checkpoint_callback: True

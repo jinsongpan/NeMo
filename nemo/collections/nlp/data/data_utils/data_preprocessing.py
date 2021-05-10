@@ -22,8 +22,11 @@ import string
 from collections import Counter
 
 import numpy as np
+import torch
+from tqdm.auto import tqdm
 
 from nemo.utils import logging
+from nemo.utils.env_var_parsing import get_envint
 
 __all__ = [
     'DataProcessor',
@@ -50,10 +53,11 @@ __all__ = [
     'dataset_to_ids',
     'get_freq_weights',
     'fill_class_weights',
-    'calc_class_weights',
     'normalize_answer',
     'get_labels_to_labels_id_mapping',
     'get_vocab',
+    'find_newlines',
+    'load_data_indices',
 ]
 
 DATABASE_EXISTS_TMP = '{} dataset has already been processed and stored at {}'
@@ -331,8 +335,8 @@ def get_labels_to_labels_id_mapping(file):
     '''
     lines = open(file, 'r').readlines()
     lines = [line.strip() for line in lines if line.strip()]
-    labels = {lines[i]: i for i in range(len(lines))}
-    return labels
+    label_ids = {lines[i]: i for i in range(len(lines))}
+    return label_ids
 
 
 def if_exist(outfold, files):
@@ -350,35 +354,39 @@ def remove_punctuation_from_sentence(sentence):
     return sentence
 
 
-def dataset_to_ids(dataset, tokenizer, cache_ids=False, add_bos_eos=True):
+def dataset_to_ids(dataset, tokenizer, cache_ids=False, add_bos_eos=True, cache_data_per_node=False, use_cache=False):
     """
     Reads dataset from file line by line, tokenizes each line with tokenizer,
     and returns list of lists which corresponds to ids of tokenized strings.
 
     Args:
-        dataset: path to dataset
+        dataset (str): path to dataset
         tokenizer: tokenizer to convert text into ids
-        cache_ids: if True, ids are saved to disk as pickle file
+        cache_ids (bool): if True, ids are saved to disk as pickle file
             with similar name (e.g., data.txt --> data.txt.pkl)
-        add_bos_eos: bool, whether to add <s> and </s> symbols (e.g., for NMT)
+        add_bos_eos (bool): whether to add <s> and </s> symbols (e.g., for NMT)
+        cache_data_per_node (bool): Cache data on local_rank 0. Use when there is not a shared-filesystem.
+        use_cache (bool): Use cached ids if they exist.
     Returns:
         ids: list of ids which correspond to tokenized strings of the dataset
     """
 
     cached_ids_dataset = dataset + str(".pkl")
-    if os.path.isfile(cached_ids_dataset):
+    if use_cache and os.path.isfile(cached_ids_dataset):
         logging.info("Loading cached tokenized dataset ...")
         ids = pickle.load(open(cached_ids_dataset, "rb"))
     else:
-        logging.info("Tokenizing dataset ...")
+        logging.info(f"Tokenizing dataset {dataset}...")
         data = open(dataset, "rb").readlines()
         ids = []
-        for sentence in data:
+        for sentence in tqdm(data, desc='Tokenizing sentence'):
             sent_ids = tokenizer.text_to_ids(sentence.decode("utf-8"))
             if add_bos_eos:
                 sent_ids = [tokenizer.bos_id] + sent_ids + [tokenizer.eos_id]
             ids.append(sent_ids)
-        if cache_ids:
+        if cache_ids and (
+            not torch.distributed.is_initialized() or (cache_data_per_node and get_envint("LOCAL_RANK", 0) == 0)
+        ):
             logging.info("Caching tokenized dataset ...")
             pickle.dump(ids, open(cached_ids_dataset, "wb"))
     return ids
@@ -420,13 +428,52 @@ def fill_class_weights(weights, max_id=-1):
     return all_weights
 
 
-def calc_class_weights(label_freq, max_id=-1):
-    weights_dict = get_freq_weights(label_freq)
-    return fill_class_weights(weights_dict, max_id=max_id)
-
-
 def get_vocab(file):
     lines = open(file, 'r').readlines()
     lines = [line.strip() for line in lines if line.strip()]
     labels = {i: lines[i] for i in range(len(lines))}
     return labels
+
+
+def find_newlines(contents):
+    """
+    Finds all of the newline positions in a text file.
+    """
+    start = 0
+
+    while True:
+        try:
+            # index and split are much faster than Python for loops
+            new_start = contents.index(b"\n", start)
+            line = (
+                contents[start:new_start]
+                .replace(b"\xc2\x99", b" ")
+                .replace(b"\xc2\xa0", b" ")
+                .decode("utf-8", errors="ignore")
+            )
+
+            if len(line.split()) > 0:
+                yield start
+
+            start = new_start + 1
+
+        except ValueError:
+            break
+
+
+def load_data_indices(idx_file: str, data_file: str, savename: str):
+    """
+    Loads dataset index file if it exsits
+    """
+    data_dir = data_file[: data_file.rfind('/')]
+    mode = data_file[data_file.rfind('/') + 1 : data_file.rfind('.')]
+    idx_file = f"{data_dir}/{mode}_{savename}.pkl"
+
+    if os.path.isfile(idx_file):
+        # If the sentence indices file already exists, load from it
+        with open(idx_file, "rb") as f:
+            indices = pickle.load(f)
+
+            return indices, idx_file, data_dir
+
+    return None, idx_file, data_dir

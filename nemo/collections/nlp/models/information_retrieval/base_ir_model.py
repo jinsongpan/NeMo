@@ -21,22 +21,21 @@ from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
 
 from nemo.collections.nlp.data import BertInformationRetrievalDataset
+from nemo.collections.nlp.models.nlp_model import NLPModel
 from nemo.collections.nlp.modules.common.lm_utils import get_lm_model
-from nemo.collections.nlp.modules.common.tokenizer_utils import get_tokenizer
 from nemo.core.classes.common import typecheck
-from nemo.core.classes.modelPT import ModelPT
 
 __all__ = ['BaseIRModel']
 
 
-class BaseIRModel(ModelPT):
+class BaseIRModel(NLPModel):
     """
     Base class for information retrieval models.
     """
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
 
-        self._setup_tokenizer(cfg.tokenizer)
+        self.setup_tokenizer(cfg.tokenizer)
 
         super().__init__(cfg=cfg, trainer=trainer)
 
@@ -58,6 +57,7 @@ class BaseIRModel(ModelPT):
             config_file=cfg.language_model.config_file,
             config_dict=OmegaConf.to_container(cfg.language_model.config) if cfg.language_model.config else None,
             checkpoint_file=cfg.language_model.lm_checkpoint,
+            vocab_file=cfg.tokenizer.vocab_file,
         )
         vocab_size, hidden_size = model.config.vocab_size, model.config.hidden_size
         tokens_to_add = 8 * math.ceil(vocab_size / 8) - vocab_size
@@ -174,15 +174,6 @@ class BaseIRModel(ModelPT):
         }
 
         return {"log": tensorboard_logs}
-
-    def _setup_tokenizer(self, cfg: DictConfig):
-        tokenizer = get_tokenizer(
-            tokenizer_name=cfg.tokenizer_name,
-            tokenizer_model=cfg.tokenizer_model,
-            special_tokens=OmegaConf.to_container(cfg.special_tokens) if cfg.special_tokens else None,
-            vocab_file=cfg.vocab_file,
-        )
-        self.tokenizer = tokenizer
 
     def setup_training_data(self, train_data_config: Optional[DictConfig]):
         self._train_dl = self._setup_dataloader_from_config(cfg=train_data_config)

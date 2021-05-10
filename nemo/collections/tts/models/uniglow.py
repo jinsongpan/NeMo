@@ -19,11 +19,12 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import MISSING, DictConfig, OmegaConf, open_dict
 from pystoi import stoi
+from pytorch_lightning.loggers import LoggerCollection, TensorBoardLogger
 
-from nemo.collections.tts.helpers.helpers import waveglow_log_to_tb_func
+from nemo.collections.tts.helpers.helpers import OperationMode, waveglow_log_to_tb_func
 from nemo.collections.tts.losses.uniglowloss import UniGlowLoss
-from nemo.collections.tts.models.base import Vocoder
-from nemo.collections.tts.modules.uniglow import OperationMode, UniGlowModule
+from nemo.collections.tts.models.base import GlowVocoder
+from nemo.collections.tts.modules.uniglow import UniGlowModule
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
 from nemo.core.neural_types.elements import (
     AudioSignal,
@@ -37,26 +38,15 @@ from nemo.utils import logging
 
 
 @dataclass
-class PreprocessorParams:
-    pad_value: float = MISSING
-
-
-@dataclass
-class Preprocessor:
-    cls: str = MISSING
-    params: PreprocessorParams = PreprocessorParams()
-
-
-@dataclass
 class WaveglowConfig:
     waveglow: Dict[Any, Any] = MISSING
-    preprocessor: Preprocessor = Preprocessor()
+    preprocessor: Dict[Any, Any] = MISSING
     sigma: float = MISSING
     train_ds: Optional[Dict[Any, Any]] = None
     validation_ds: Optional[Dict[Any, Any]] = None
 
 
-class UniGlowModel(Vocoder):
+class UniGlowModel(GlowVocoder):
     """Waveglow model used to convert betweeen spectrograms and audio"""
 
     def __init__(self, cfg: DictConfig, trainer: 'Trainer' = None):
@@ -73,7 +63,6 @@ class UniGlowModel(Vocoder):
         # Ensure passed cfg is compliant with schema
         OmegaConf.merge(cfg, schema)
 
-        self.pad_value = self._cfg.preprocessor.params.pad_value
         self.sigma = self._cfg.sigma
         self.audio_to_melspec_precessor = instantiate(self._cfg.preprocessor)
         self.model = UniGlowModule(
@@ -88,6 +77,19 @@ class UniGlowModel(Vocoder):
         self.mode = OperationMode.infer
         self.loss = UniGlowLoss(self._cfg.uniglow.stft_loss_coef)
         self.removed_weightnorm = False
+
+    @property
+    def mode(self):
+        return self._mode
+
+    @mode.setter
+    def mode(self, new_mode):
+        if new_mode == OperationMode.training:
+            self.train()
+        else:
+            self.eval()
+        self._mode = new_mode
+        self.model.mode = new_mode
 
     @property
     def input_types(self):
@@ -115,9 +117,7 @@ class UniGlowModel(Vocoder):
     @typecheck()
     def forward(self, *, audio, audio_len):
         if self.mode != self.model.mode:
-            raise ValueError(
-                f"WaveGlowModel's mode {self.mode} does not match WaveGlowModule's mode {self.model.mode}"
-            )
+            raise ValueError(f"UniGlowModel's mode {self.mode} does not match UniGlowModule's mode {self.model.mode}")
         spec, spec_len = self.audio_to_melspec_precessor(audio, audio_len)
         tensors = self.model(spec=spec, audio=audio, sigma=self.sigma)
         if self.mode == OperationMode.training:
@@ -128,25 +128,31 @@ class UniGlowModel(Vocoder):
         return tensors
 
     @typecheck(
-        input_types={"spec": NeuralType(('B', 'D', 'T'), MelSpectrogramType()), "sigma": NeuralType(optional=True)},
+        input_types={
+            "spec": NeuralType(('B', 'D', 'T'), MelSpectrogramType()),
+            "sigma": NeuralType(optional=True),
+            "denoise": NeuralType(optional=True),
+            "denoiser_strength": NeuralType(optional=True),
+        },
         output_types={"audio": NeuralType(('B', 'T'), AudioSignal())},
     )
-    def convert_spectrogram_to_audio(self, spec: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
+    def convert_spectrogram_to_audio(
+        self, spec: torch.Tensor, sigma: bool = 1.0, denoise: bool = True, denoiser_strength: float = 0.01
+    ) -> torch.Tensor:
         if not self.removed_weightnorm:
-            self.waveglow.remove_weightnorm()
+            self.model.remove_weightnorm()
             self.removed_weightnorm = True
-        self.eval()
         self.mode = OperationMode.infer
-        self.model.mode = OperationMode.infer
 
         with torch.no_grad():
             audio = self.model(spec=spec, audio=None, sigma=sigma)
+            if denoise:
+                audio = self.denoise(audio=audio, strength=denoiser_strength)
 
         return audio
 
     def training_step(self, batch, batch_idx):
         self.mode = OperationMode.training
-        self.model.mode = OperationMode.training
         audio, audio_len = batch
         z, logdet, predicted_audio = self(audio=audio, audio_len=audio_len)
         loss = self.loss(z=z, logdet=logdet, gt_audio=audio, predicted_audio=predicted_audio, sigma=self.sigma)
@@ -159,14 +165,13 @@ class UniGlowModel(Vocoder):
 
     def validation_step(self, batch, batch_idx):
         self.mode = OperationMode.validation
-        self.model.mode = OperationMode.validation
         audio, audio_len = batch
         z, logdet, predicted_audio, spec, spec_len = self(audio=audio, audio_len=audio_len)
         loss = self.loss(z=z, logdet=logdet, gt_audio=audio, predicted_audio=predicted_audio, sigma=self.sigma)
 
         # compute average stoi score for batch
         stoi_score = 0
-        sr = self._cfg.preprocessor.params.sample_rate
+        sr = self._cfg.preprocessor.sample_rate
         for audio_i, audio_recon_i in zip(audio.cpu(), predicted_audio.cpu()):
             stoi_score += stoi(audio_i, audio_recon_i, sr)
         stoi_score /= audio.shape[0]
@@ -181,8 +186,14 @@ class UniGlowModel(Vocoder):
 
     def validation_epoch_end(self, outputs):
         if self.logger is not None and self.logger.experiment is not None:
+            tb_logger = self.logger.experiment
+            if isinstance(self.logger, LoggerCollection):
+                for logger in self.logger:
+                    if isinstance(logger, TensorBoardLogger):
+                        tb_logger = logger.experiment
+                        break
             waveglow_log_to_tb_func(
-                self.logger.experiment,
+                tb_logger,
                 tuple(outputs[0].values())[:-1],
                 self.global_step,
                 tag="eval",
@@ -196,9 +207,9 @@ class UniGlowModel(Vocoder):
 
     def __setup_dataloader_from_config(self, cfg, shuffle_should_be: bool = True, name: str = "train"):
         if "dataset" not in cfg or not isinstance(cfg.dataset, DictConfig):
-            raise ValueError(f"No dataset for {name}")  # TODO
+            raise ValueError(f"No dataset for {name}")
         if "dataloader_params" not in cfg or not isinstance(cfg.dataloader_params, DictConfig):
-            raise ValueError(f"No dataloder_params for {name}")  # TODO
+            raise ValueError(f"No dataloder_params for {name}")
         if shuffle_should_be:
             if 'shuffle' not in cfg.dataloader_params:
                 logging.warning(
@@ -230,9 +241,10 @@ class UniGlowModel(Vocoder):
         """
         list_of_models = []
         model = PretrainedModelInfo(
-            pretrained_model_name="UniGlow-22050Hz",
-            location="https://drive.google.com/file/d/18JO5heoz1pBicZnGGqJzAJYMpzxiDQDa/view?usp=sharing",
-            description="The model is trained on LJSpeech sampled at 22050Hz, and can be used as an universal vocoder",
+            pretrained_model_name="tts_uniglow",
+            location="https://api.ngc.nvidia.com/v2/models/nvidia/nemo/tts_uniglow/versions/1.0.0rc1/files/tts_uniglow.nemo",
+            description="This model is trained on LJSpeech sampled at 22050Hz, and has been tested on generating female English voices with an American accent.",
+            class_=cls,
         )
         list_of_models.append(model)
         return list_of_models
@@ -244,7 +256,7 @@ class UniGlowModel(Vocoder):
         Returns:
             An integer representing the upsampling factor
         """
-        audio = torch.ones(1, self._cfg.train_ds.dataset.params.n_segments)
+        audio = torch.ones(1, self._cfg.train_ds.dataset.n_segments)
         spec, spec_len = self.audio_to_melspec_precessor(audio, torch.FloatTensor([len(audio)]))
         spec = spec[:, :, :-1]
         audio = audio.unfold(1, self._cfg.uniglow.n_group, self._cfg.uniglow.n_group).permute(0, 2, 1)

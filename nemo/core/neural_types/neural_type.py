@@ -29,6 +29,7 @@ __all__ = [
 class NeuralType(object):
     """This is the main class which would represent neural type concept.
     It is used to represent *the types* of inputs and outputs.
+
     Args:
         axes (Optional[Tuple]): a tuple of AxisTypes objects representing the semantics of what varying each axis means
             You can use a short, string-based form here. For example: ('B', 'C', 'H', 'W') would correspond to an NCHW
@@ -50,8 +51,8 @@ class NeuralType(object):
     def __init__(self, axes: Optional[Tuple] = None, elements_type: ElementType = VoidType(), optional=False):
         if not isinstance(elements_type, ElementType):
             raise ValueError(
-                f"elements_type of NeuralType must be an instance of a class derived from ElementType."
-                f"Did you pass a class instead?"
+                "elements_type of NeuralType must be an instance of a class derived from ElementType. "
+                "Did you pass a class instead?"
             )
         self.elements_type = elements_type
         if axes is not None:
@@ -63,7 +64,7 @@ class NeuralType(object):
                 elif isinstance(axis, AxisType):
                     axes_list.append(axis)
                 else:
-                    raise ValueError(f"axis type must be either str or AxisType instance")
+                    raise ValueError("axis type must be either str or AxisType instance")
             self.axes = tuple(axes_list)
         else:
             self.axes = None
@@ -198,11 +199,28 @@ class NeuralType(object):
             else:
                 return 3
 
+    def __repr__(self):
+        if self.axes is not None:
+            axes = str(self.axes)
+        else:
+            axes = "None"
+
+        if self.elements_type is not None:
+            element_type = repr(self.elements_type)
+        else:
+            element_type = "None"
+
+        data = f"axis={axes}, element_type={element_type}"
+
+        if self.optional:
+            data = f"{data}, optional={self.optional}"
+
+        final = f"{self.__class__.__name__}({data})"
+        return final
+
 
 class NeuralTypeError(Exception):
     """Base class for neural type related exceptions."""
-
-    pass
 
 
 class NeuralPortNameMismatchError(NeuralTypeError):
@@ -210,6 +228,7 @@ class NeuralPortNameMismatchError(NeuralTypeError):
     names."""
 
     def __init__(self, input_port_name):
+        super().__init__()
         self.message = "Wrong input port name: {0}".format(input_port_name)
 
 
@@ -218,6 +237,7 @@ class NeuralPortNmTensorMismatchError(NeuralTypeError):
     type."""
 
     def __init__(self, class_name, port_name, first_type, second_type, type_comatibility):
+        super().__init__()
         self.message = "\nIn {}. \nPort: {} and a NmTensor it was fed are \n".format(class_name, port_name)
         self.message += "of incompatible neural types:\n\n{} \n\n and \n\n{}".format(first_type, second_type)
         self.message += "\n\nType comparison result: {}".format(type_comatibility)

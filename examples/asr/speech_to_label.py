@@ -16,10 +16,10 @@
 # Task 1: Speech Command
 
 ## Preparing the dataset
-Use the `process_speech_commands_data.py` script under <NEMO_ROOT>/scripts in order to prepare the dataset.
+Use the `process_speech_commands_data.py` script under <NEMO_ROOT>/scripts/dataset_processing in order to prepare the dataset.
 
 ```sh
-python <NEMO_ROOT>/scripts/process_speech_commands_data.py \
+python <NEMO_ROOT>/scripts/dataset_processing/process_speech_commands_data.py \
     --data_root=<absolute path to where the data should be stored> \
     --data_version=<either 1 or 2, indicating version of the dataset> \
     --class_split=<either "all" or "sub", indicates whether all 30/35 classes should be used, or the 10+2 split should be used> \
@@ -34,7 +34,7 @@ python speech_to_label.py \
     model.train_ds.manifest_filepath="<path to train manifest>" \
     model.validation_ds.manifest_filepath=["<path to val manifest>","<path to test manifest>"] \
     trainer.gpus=2 \
-    trainer.distributed_backend="ddp" \
+    trainer.accelerator="ddp" \
     trainer.max_epochs=200 \
     exp_manager.create_wandb_logger=True \
     exp_manager.wandb_logger_kwargs.name="MatchboxNet-3x1x64-v1" \
@@ -47,14 +47,14 @@ python speech_to_label.py \
 # Task 2: Voice Activity Detection
 
 ## Preparing the dataset
-Use the `process_vad_data.py` script under <NEMO_ROOT>/scripts in order to prepare the dataset.
+Use the `process_vad_data.py` script under <NEMO_ROOT>/scripts/dataset_processing in order to prepare the dataset.
 
 ```sh
 python process_vad_data.py \
     --out_dir=<output path to where the generated manifest should be stored> \
     --speech_data_root=<path where the speech data are stored> \
     --background_data_root=<path where the background data are stored> \
-    --rebalance_method=<'under' or 'over' of 'fixed'> \ 
+    --rebalance_method=<'under' or 'over' of 'fixed'> \
     --log
     (Optional --demo (for demonstration in tutorial). If you want to use your own background noise data, make sure to delete --demo)
 ```
@@ -62,12 +62,12 @@ python process_vad_data.py \
 ## Train to convergence
 ```sh
 python speech_to_label.py \
-    --config-path=<path to dir of configs e.g. "conf"> 
+    --config-path=<path to dir of configs e.g. "conf">
     --config-name=<name of config without .yaml e.g. "matchboxnet_3x1x64_vad"> \
     model.train_ds.manifest_filepath="<path to train manifest>" \
     model.validation_ds.manifest_filepath=["<path to val manifest>","<path to test manifest>"] \
     trainer.gpus=2 \
-    trainer.distributed_backend="ddp" \
+    trainer.accelerator="ddp" \
     trainer.max_epochs=200 \
     exp_manager.create_wandb_logger=True \
     exp_manager.wandb_logger_kwargs.name="MatchboxNet-3x1x64-vad" \
@@ -75,6 +75,33 @@ python speech_to_label.py \
     +trainer.precision=16 \
     +trainer.amp_level=O1  # needed if using PyTorch < 1.6
 ```
+
+# Optional: Use tarred dataset to speed up data loading. Apply to both tasks.
+## Prepare tarred dataset. 
+   Prepare ONE manifest that contains all training data you would like to include. Validation should use non-tarred dataset.
+   Note that it's possible that tarred datasets impacts validation scores because it drop values in order to have same amount of files per tarfile; 
+   Scores might be off since some data is missing. 
+
+   Use the `convert_to_tarred_audio_dataset.py` script under <NEMO_ROOT>/scripts/speech_recognition in order to prepare tarred audio dataset.
+   For details, please see TarredAudioToClassificationLabelDataset in <NEMO_ROOT>/nemo/collections/asr/data/audio_to_label.py
+
+python speech_to_label.py \
+    --config-path=<path to dir of configs e.g. "conf">
+    --config-name=<name of config without .yaml e.g. "matchboxnet_3x1x64_vad"> \
+    model.train_ds.manifest_filepath=<path to train tarred_audio_manifest.json> \
+    model.train_ds.is_tarred=True \
+    model.train_ds.tarred_audio_filepaths=<path to train tarred audio dataset e.g. audio_{0..2}.tar> \
+    +model.train_ds.num_worker=<num_shards used generating tarred dataset> \
+    model.validation_ds.manifest_filepath=<path to validation audio_manifest.json>\
+    trainer.gpus=2 \
+    trainer.accelerator="ddp" \
+    trainer.max_epochs=200 \
+    exp_manager.create_wandb_logger=True \
+    exp_manager.wandb_logger_kwargs.name="MatchboxNet-3x1x64-vad" \
+    exp_manager.wandb_logger_kwargs.project="MatchboxNet-vad" \
+    +trainer.precision=16 \
+    +trainer.amp_level=O1  # needed if using PyTorch < 1.6
+
 """
 import pytorch_lightning as pl
 

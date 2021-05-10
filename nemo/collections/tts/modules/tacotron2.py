@@ -29,14 +29,6 @@ from nemo.core.neural_types.elements import (
 from nemo.core.neural_types.neural_type import NeuralType
 from nemo.utils import logging
 
-_NATIVE_AMP = False
-try:
-    from torch.cuda.amp import autocast
-
-    _NATIVE_AMP = True
-except ImportError:
-    pass
-
 
 class Encoder(NeuralModule):
     def __init__(
@@ -101,23 +93,11 @@ class Encoder(NeuralModule):
         )
 
         self.lstm.flatten_parameters()
-        # TODO: Pytorch 1.6 has issues with rnns and amp, so cast to float until fixed
-        if _NATIVE_AMP:
-            token_embedding = token_embedding.float()
         outputs, _ = self.lstm(token_embedding)
 
         outputs, _ = torch.nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True)
 
         return outputs
-
-    def save_to(self, save_path: str):
-        # TODO: Implement me!
-        pass
-
-    @classmethod
-    def restore_from(cls, restore_path: str):
-        # TODO: Implement me!
-        pass
 
 
 class Decoder(NeuralModule):
@@ -276,16 +256,9 @@ class Decoder(NeuralModule):
     def decode(self, decoder_input):
         cell_input = torch.cat((decoder_input, self.attention_context), -1)
 
-        # TODO: Pytorch 1.6 has issues with rnns and amp, so cast to float until fixed
-        if _NATIVE_AMP:
-            with autocast(enabled=False):
-                self.attention_hidden, self.attention_cell = self.attention_rnn(
-                    cell_input.float(), (self.attention_hidden, self.attention_cell)
-                )
-        else:
-            self.attention_hidden, self.attention_cell = self.attention_rnn(
-                cell_input, (self.attention_hidden, self.attention_cell)
-            )
+        self.attention_hidden, self.attention_cell = self.attention_rnn(
+            cell_input, (self.attention_hidden, self.attention_cell)
+        )
         self.attention_hidden = F.dropout(self.attention_hidden, self.p_attention_dropout, self.training)
 
         attention_weights_cat = torch.cat(
@@ -298,16 +271,9 @@ class Decoder(NeuralModule):
         self.attention_weights_cum += self.attention_weights
         decoder_input = torch.cat((self.attention_hidden, self.attention_context), -1)
 
-        # TODO: Pytorch 1.6 has issues with rnns and amp, so cast to float until fixed
-        if _NATIVE_AMP:
-            with autocast(enabled=False):
-                self.decoder_hidden, self.decoder_cell = self.decoder_rnn(
-                    decoder_input, (self.decoder_hidden, self.decoder_cell)
-                )
-        else:
-            self.decoder_hidden, self.decoder_cell = self.decoder_rnn(
-                decoder_input, (self.decoder_hidden, self.decoder_cell)
-            )
+        self.decoder_hidden, self.decoder_cell = self.decoder_rnn(
+            decoder_input, (self.decoder_hidden, self.decoder_cell)
+        )
         self.decoder_hidden = F.dropout(self.decoder_hidden, self.p_decoder_dropout, self.training)
 
         decoder_hidden_attention_context = torch.cat((self.decoder_hidden, self.attention_context), dim=1)
@@ -330,7 +296,7 @@ class Decoder(NeuralModule):
             mel_output, gate_output, attention_weights = self.decode(decoder_input)
 
             mel_outputs += [mel_output.squeeze(1)]
-            gate_outputs += [gate_output.squeeze()]
+            gate_outputs += [gate_output]
             alignments += [attention_weights]
 
         mel_outputs, gate_outputs, alignments = self.parse_decoder_outputs(mel_outputs, gate_outputs, alignments)
@@ -380,15 +346,6 @@ class Decoder(NeuralModule):
         mel_outputs, gate_outputs, alignments = self.parse_decoder_outputs(mel_outputs, gate_outputs, alignments)
 
         return mel_outputs, gate_outputs, alignments, mel_lengths
-
-    def save_to(self, save_path: str):
-        # TODO: Implement me!
-        pass
-
-    @classmethod
-    def restore_from(cls, restore_path: str):
-        # TODO: Implement me!
-        pass
 
 
 class Postnet(NeuralModule):
@@ -483,12 +440,3 @@ class Postnet(NeuralModule):
         mel_spec_out = F.dropout(self.convolutions[-1](mel_spec_out), self.p_dropout, self.training)
 
         return mel_spec + mel_spec_out
-
-    def save_to(self, save_path: str):
-        # TODO: Implement me!
-        pass
-
-    @classmethod
-    def restore_from(cls, restore_path: str):
-        # TODO: Implement me!
-        pass

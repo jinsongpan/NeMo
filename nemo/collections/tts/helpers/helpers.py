@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from enum import Enum
 from typing import Dict, Sequence
 
 import librosa
@@ -26,10 +27,18 @@ from pytorch_lightning.utilities import rank_zero_only
 from nemo.utils import logging
 
 
+class OperationMode(Enum):
+    """Training or Inference (Evaluation) mode"""
+
+    training = 0
+    validation = 1
+    infer = 2
+
+
 def get_mask_from_lengths(lengths, max_len=None):
     if not max_len:
         max_len = torch.max(lengths).item()
-    ids = torch.arange(0, max_len, out=torch.cuda.LongTensor(max_len))
+    ids = torch.arange(0, max_len, device=lengths.device, dtype=torch.long)
     mask = (ids < lengths.unsqueeze(1)).bool()
     return mask
 

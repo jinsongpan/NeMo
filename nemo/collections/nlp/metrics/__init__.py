@@ -13,4 +13,4 @@
 # limitations under the License.
 
 from nemo.collections.nlp.metrics.classification_report import ClassificationReport
-from nemo.collections.nlp.metrics.perplexity import Perplexity
+from nemo.collections.nlp.metrics.sequence_perplexity import SequencePerplexity
